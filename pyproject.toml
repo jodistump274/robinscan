@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robinscan-arb"
+version = "0.1.0"
+description = "Count closed-loop DEX arbitrage transactions in Robinhood Chain blocks"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "jodistump274"}]
+dependencies = []
+
+[project.scripts]
+robinscan-arb = "robinscan_arb:main"
+
+[tool.setuptools]
+py-modules = ["robinscan_arb"]
