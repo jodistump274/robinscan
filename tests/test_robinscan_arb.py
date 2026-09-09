@@ -33,6 +33,7 @@ class DetectorTests(unittest.TestCase):
     WETH_POOL = "0x52e65b17fb6e5ba00ed806f37afcd2daa50271ca"
     EXECUTOR = "0x980ee195eed44af65e8345f5e06fff1a6d8a9f89"
     RECEIVER = "0x1c5d8792098bcd216a593f4f87618088c6f5dde0"
+    CALLER = "0x637b712d51f2a7690eae7c7691d81691d290aae9"
 
     def transfer(self, token, from_address, to_address, amount, index):
         token_name = "par" if token == self.PAR else "WETH" if token == self.WETH else "USDG"
@@ -100,7 +101,7 @@ class DetectorTests(unittest.TestCase):
             hash="0x8522794ada37abc62ef1f834525b4e6e9385dc3beef3644c502e342bfc719e7e",
             tx_index=1,
             status=1,
-            from_address="0x637b712d51f2a7690eae7c7691d81691d290aae9",
+            from_address=self.CALLER,
             to_address=self.EXECUTOR,
             to_is_contract=True,
             method="execute",
@@ -121,13 +122,28 @@ class DetectorTests(unittest.TestCase):
         self.assertEqual(result.gross_profit, Decimal("0.013877992"))
         self.assertEqual(result.net_profit.quantize(Decimal("0.000000001")), Decimal("0.013736532"))
 
+    def test_supplied_capital_is_not_counted_as_profit(self):
+        transfers, traces, pools = self.fixture()
+        transfers.append(
+            self.transfer(self.WETH, self.CALLER, self.EXECUTOR, "0.588023000", -1)
+        )
+        result = analyze_transaction(self.transaction(), transfers, traces, pools)
+
+        self.assertEqual(result.classification, "confirmed")
+        self.assertEqual(result.gross_profit, Decimal("0.013877992"))
+        self.assertEqual(result.profit_address, self.RECEIVER)
+
     def test_multiple_swaps_without_a_closed_path_is_only_suspected(self):
         transfers, traces, pools = self.fixture()
         result = analyze_transaction(self.transaction(), transfers, [], pools)
 
         self.assertEqual(result.classification, "suspected")
         self.assertEqual(result.swap_count, 2)
-        self.assertEqual(result.path, [])
+        self.assertEqual(result.path, ["PAR", "USDG", "WETH"])
+        self.assertEqual(result.hops, 2)
+        self.assertIsNone(result.gross_profit)
+        self.assertEqual(result.profit_token, "")
+        self.assertEqual(result.profit_address, "")
 
 
 if __name__ == "__main__":

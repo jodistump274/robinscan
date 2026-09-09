@@ -22,14 +22,21 @@
 - 交易执行成功；
 - 至少两个可识别的 Swap；
 - Swap 方向形成资产闭环，例如 `WETH -> PAR -> USDG -> WETH`；
-- 能在执行器或最终利润接收地址识别到正数的终端利润。
+- 以交易发起者、执行器和最终接收者组成资金组，能识别到闭环起始资产的正数净增量。
+
+`gross` 是该资金组对外净流入减净流出的闭环资产余额，不是最后一笔 Token Transfer
+的金额。发起者提供的本金、组内转账、闪电流动性借入和归还不会被重复计为利润。
 
 ### Suspected
 
 以下情况会单独列为疑似，不计入确认 ARB：
 
 - Swap 已闭环，但 Robinscan 数据不足以计算终端利润；
-- 检测到多个 Swap，但部分池或资产无法解析，Path 没有闭环。
+- 检测到至少两个方向连续的 Swap，但部分池或资产无法解析，Path 没有闭环。
+
+开放 Path 会显示 `[open]`，例如 `PAR -> USDG -> WETH [open]`。因为无法证明闭环，
+此类交易不会显示 `gross`，以免把大额交易数量误报成利润。彼此无连接的多个 Swap
+不再列为疑似套利。
 
 `ETH` 与 `WETH` 在闭环判断时视为同一种基础资产。
 
@@ -51,7 +58,7 @@ python robinscan_arb.py --limit 25 --details
 block 57587427   tx=8   ARB=0  suspected=0  scanned=5  skipped=3  errors=0
 block 57587426   tx=14  ARB=2  suspected=1  scanned=9  skipped=5  errors=0
   ARB 0x...  WETH -> PAR -> USDG -> WETH  gross=0.013877992 WETH net=0.013736532 WETH
-  ?   0x...  incomplete  gross=unknown
+  ?   0x...  PAR -> USDG -> WETH [open]
 ```
 
 ## 常用命令
@@ -140,9 +147,10 @@ WETH -> PAR -> USDG -> WETH
 
 - `par`/`PAR` 大小写不会破坏闭环；
 - 三个 Swap 被识别为一笔三角套利；
-- 毛利润 `0.013877992 WETH`；
+- 资金组净增量（毛利润）`0.013877992 WETH`；
+- 发起者投入的本金不会被计入利润；
 - 扣除 Gas 后净利约 `0.013736532 WETH`；
-- 缺少 V4 Hop 时只标记为疑似。
+- 缺少 V4 Hop 时显示已解析的开放 Path、只标记为疑似且不输出虚假利润。
 
 ## 注意
 

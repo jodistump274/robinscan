@@ -26,9 +26,9 @@ DEX_NAME_RE = re.compile(
     r"uniswap|pancake|sushi|aerodrome|curve|balancer|pool manager|\bpool\b|\bmarket\b",
     re.IGNORECASE,
 )
-ANCHORS = {
-    "ETH",
+ANCHOR_PRIORITY = (
     "WETH",
+    "ETH",
     "USDG",
     "USDC",
     "USDT",
@@ -38,7 +38,7 @@ ANCHORS = {
     "USD1",
     "PYUSD",
     "USDE",
-}
+)
 SIMPLE_METHODS = {
     "system",
     "approve",
@@ -461,6 +461,38 @@ def find_cycle(edges: list[Edge], preferred_start: str = "") -> tuple[list[str],
     return best_tokens, best_edges
 
 
+def find_longest_path(
+    edges: list[Edge], preferred_start: str = ""
+) -> tuple[list[str], list[Edge]]:
+    """Return the longest directed, edge-simple path, even when it is open."""
+    best_tokens: list[str] = []
+    best_edges: list[Edge] = []
+    starts = [preferred_start] if preferred_start else []
+    starts.extend(edge.from_symbol for edge in edges if edge.from_symbol not in starts)
+    limit = min(len(edges), 10)
+
+    for start in starts:
+        if not start:
+            continue
+
+        def walk(current: str, used: set[int], tokens: list[str], route: list[Edge]) -> None:
+            nonlocal best_tokens, best_edges
+            if len(route) > len(best_edges):
+                best_tokens = tokens.copy()
+                best_edges = route.copy()
+            if len(route) >= limit:
+                return
+            for index, edge in enumerate(edges):
+                if index in used or edge.from_symbol != current:
+                    continue
+                used.add(index)
+                walk(edge.to_symbol, used, tokens + [edge.to_symbol], route + [edge])
+                used.remove(index)
+
+        walk(start, set(), [start], [])
+    return best_tokens, best_edges
+
+
 def select_executor(
     transfers: list[Transfer], traces: list[dict[str, Any]], edges: list[Edge], v3_addresses: set[str], dex_addresses: set[str]
 ) -> str:
@@ -492,10 +524,22 @@ def select_executor(
 
 def estimate_profit(
     executor: str,
+    transaction_from: str,
+    transaction_to: str,
+    profit_token: str,
     transfers: list[Transfer],
     traces: list[dict[str, Any]],
     dex_addresses: set[str],
 ) -> tuple[str, str, Decimal | None, Decimal | None]:
+    """Measure the closed route's token surplus across the searcher's actor group.
+
+    Transfers inside the group are ignored. Capital supplied by the transaction
+    sender, flash liquidity, repayments and pool flows therefore contribute only
+    their net change instead of being mistaken for terminal profit.
+    """
+    if not profit_token:
+        return "", "", None, None
+
     flash_providers: set[str] = set()
     all_dex = set(dex_addresses)
     for trace in traces:
@@ -507,7 +551,12 @@ def estimate_profit(
             all_dex.add(lower(trace.get("from")))
             all_dex.add(lower(trace.get("to")))
 
-    actors = {executor} if executor else set()
+    actors = {
+        address
+        for address in (executor, lower(transaction_from), lower(transaction_to))
+        if address and address != ZERO_ADDRESS
+    }
+    token_addresses = {transfer.token for transfer in transfers}
     changed = True
     while changed:
         changed = False
@@ -517,51 +566,53 @@ def estimate_profit(
                 and transfer.to_address != ZERO_ADDRESS
                 and transfer.to_address not in all_dex
                 and transfer.to_address not in flash_providers
+                and transfer.to_address not in token_addresses
                 and transfer.to_address not in actors
             ):
                 actors.add(transfer.to_address)
                 changed = True
 
-    sinks: list[Transfer] = []
-    for transfer in transfers:
-        if (
-            transfer.from_address not in actors
-            or transfer.to_address == ZERO_ADDRESS
-            or transfer.to_address in all_dex
-            or transfer.to_address in flash_providers
-        ):
-            continue
-        later_out = any(
-            other.log_index > transfer.log_index
-            and other.from_address == transfer.to_address
-            and other.token == transfer.token
-            for other in transfers
-        )
-        if not later_out:
-            sinks.append(transfer)
-
-    direct = sinks[-1] if sinks else None
     balances: dict[str, Decimal] = {}
     prices: dict[str, Decimal] = {}
     for transfer in transfers:
+        balance_symbol = transfer.symbol
+        if profit_token in {"ETH", "WETH"} and transfer.symbol in {"ETH", "WETH"}:
+            balance_symbol = profit_token
         if transfer.price_usd is not None:
-            prices[transfer.symbol] = transfer.price_usd
-        if transfer.to_address == executor:
-            balances[transfer.symbol] = balances.get(transfer.symbol, Decimal(0)) + transfer.amount
-        if transfer.from_address == executor:
-            balances[transfer.symbol] = balances.get(transfer.symbol, Decimal(0)) - transfer.amount
+            prices[balance_symbol] = transfer.price_usd
+        from_actor = transfer.from_address in actors
+        to_actor = transfer.to_address in actors
+        if to_actor and not from_actor:
+            balances[balance_symbol] = balances.get(balance_symbol, Decimal(0)) + transfer.amount
+        elif from_actor and not to_actor:
+            balances[balance_symbol] = balances.get(balance_symbol, Decimal(0)) - transfer.amount
 
-    retained = sorted(
-        ((name, amount) for name, amount in balances.items() if amount > Decimal("1e-18")),
-        key=lambda item: (prices.get(item[0], Decimal(1)) * item[1]),
-        reverse=True,
-    )
-    profit_token = direct.symbol if direct else (retained[0][0] if retained else "")
-    retained_same = balances.get(profit_token, Decimal(0))
-    if retained_same < 0:
-        retained_same = Decimal(0)
-    gross = (direct.amount + retained_same) if direct else (retained[0][1] if retained else None)
-    profit_address = direct.to_address if direct else (executor if gross is not None else "")
+    gross = balances.get(profit_token)
+    profit_address = executor if gross is not None else ""
+    if gross is not None and gross > 0:
+        for transfer in transfers:
+            if (
+                (
+                    transfer.symbol == profit_token
+                    or {
+                        transfer.symbol,
+                        profit_token,
+                    }
+                    == {"ETH", "WETH"}
+                )
+                and transfer.from_address in actors
+                and transfer.to_address in actors
+                and transfer.to_address != executor
+            ):
+                later_out = any(
+                    other.log_index > transfer.log_index
+                    and other.from_address == transfer.to_address
+                    and other.token == transfer.token
+                    for other in transfers
+                )
+                if not later_out:
+                    profit_address = transfer.to_address
+
     gross_usd: Decimal | None = None
     if gross is not None and profit_token in prices:
         gross_usd = gross * prices[profit_token]
@@ -577,12 +628,34 @@ def analyze_transaction(
     transfers, token_map = parse_transfers(raw_transfers)
     edges, v3_addresses, dex_addresses = build_edges(transfers, traces, pools, token_map)
     executor = select_executor(transfers, traces, edges, v3_addresses, dex_addresses)
-    profit_token, profit_address, gross, gross_usd = estimate_profit(
-        executor, transfers, traces, dex_addresses
+    edge_symbols = {
+        symbol
+        for edge in edges
+        for symbol in (edge.from_symbol, edge.to_symbol)
+    }
+    preferred = next(
+        (symbol for symbol in ANCHOR_PRIORITY if symbol in edge_symbols),
+        "",
     )
-    wrapped = "WETH" if "WETH" in token_map.values() else "ETH"
-    preferred = wrapped if profit_token == "ETH" else profit_token
     path, route = find_cycle(edges, preferred)
+    closed = len(route) >= 2 and bool(path) and path[0] == path[-1]
+    if not closed:
+        path, route = find_longest_path(edges, preferred)
+
+    profit_token = path[0] if closed else ""
+    profit_address = ""
+    gross: Decimal | None = None
+    gross_usd: Decimal | None = None
+    if closed:
+        profit_token, profit_address, gross, gross_usd = estimate_profit(
+            executor,
+            transaction.from_address,
+            transaction.to_address,
+            profit_token,
+            transfers,
+            traces,
+            dex_addresses,
+        )
 
     dexes: dict[str, int] = {}
     for edge in route:
@@ -595,20 +668,22 @@ def analyze_transaction(
     elif gross_usd is not None:
         net_profit = None
 
-    closed = len(route) >= 2 and bool(path) and path[0] == path[-1]
     positive = gross is not None and gross > 0
     if closed and positive:
         classification = "confirmed"
-        reason = "closed swap path with measurable positive terminal profit"
+        reason = "closed swap path with positive net actor-group token surplus"
+    elif closed and gross is None:
+        classification = "suspected"
+        reason = "closed swap path, but the route-token balance could not be measured"
     elif closed:
         classification = "suspected"
-        reason = "closed swap path, but terminal profit could not be measured"
-    elif len(edges) >= 2:
+        reason = "closed swap path, but no positive net route-token surplus was measured"
+    elif len(route) >= 2:
         classification = "suspected"
-        reason = "multiple swaps found, but the directed path is incomplete"
+        reason = "connected swaps found, but the directed path is open"
     else:
         classification = "none"
-        reason = "fewer than two connected swaps"
+        reason = "fewer than two directionally connected swaps"
 
     return TransactionResult(
         hash=transaction.hash,
@@ -694,18 +769,21 @@ def print_human(result: BlockResult, details: bool) -> None:
         return
     for marker, items in (("ARB", result.confirmed), ("?", result.suspected)):
         for item in items:
-            path = " -> ".join(item.path) if item.path else "incomplete"
-            profit = (
-                f"{format_decimal(item.gross_profit)} {item.profit_token}"
-                if item.gross_profit is not None
-                else "unknown"
-            )
+            path = " -> ".join(item.path) if item.path else "unresolved"
+            if item.path and item.path[0] != item.path[-1]:
+                path += " [open]"
             net = (
                 f" net={format_decimal(item.net_profit)} {item.profit_token}"
                 if item.net_profit is not None
                 else ""
             )
-            print(f"  {marker:<3} {item.hash}  {path}  gross={profit}{net}")
+            profit = ""
+            if item.gross_profit is not None:
+                profit = (
+                    f"  gross={format_decimal(item.gross_profit)} "
+                    f"{item.profit_token}{net}"
+                )
+            print(f"  {marker:<3} {item.hash}  {path}{profit}")
     for error in result.errors:
         print(f"  ERR {error}", file=sys.stderr)
 
