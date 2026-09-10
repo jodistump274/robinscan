@@ -19,13 +19,14 @@ from dataclasses import asdict, dataclass, field
 from decimal import Decimal, InvalidOperation, getcontext
 from typing import Any, Callable, Iterable, TextIO
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
 getcontext().prec = 60
 
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 USER_AGENT = "robinscan-arb/0.2 (+https://github.com/jodistump274/robinscan)"
+DEFAULT_FEED_URL = "wss://feed.mainnet.chain.robinhood.com"
 NEXT_CHUNK_RE = re.compile(
     r'self\.__next_f\.push\(\s*\[\s*1\s*,\s*("(?:\\.|[^"\\])*")\s*\]\s*\)'
 )
@@ -60,8 +61,8 @@ class RobinscanError(RuntimeError):
     """Raised when Robinscan data cannot be fetched or decoded."""
 
 
-class RobinscanStreamClosed(RobinscanError):
-    """Raised when the Robinscan WebSocket closes or violates the protocol."""
+class LiveStreamClosed(RobinscanError):
+    """Raised when the live WebSocket closes or violates the protocol."""
 
 
 def lower(value: Any) -> str:
@@ -148,12 +149,6 @@ class Block:
     hash: str
     tx_count: int
     timestamp: str = ""
-
-
-@dataclass(slots=True)
-class StreamTicket:
-    url: str
-    ticket_protocol: str
 
 
 @dataclass(slots=True)
@@ -259,11 +254,6 @@ class RobinscanClient:
         self.timeout = timeout
         self.retries = retries
 
-    @property
-    def origin(self) -> str:
-        parsed = urlparse(self.base_url)
-        return f"{parsed.scheme}://{parsed.netloc}"
-
     def _get(self, path: str) -> str:
         url = urljoin(self.base_url, path.lstrip("/"))
         request = Request(
@@ -287,49 +277,6 @@ class RobinscanClient:
             if attempt < self.retries:
                 time.sleep(0.25 * (2**attempt))
         raise RobinscanError(f"GET {url} failed: {last_error}")
-
-    def stream_ticket(self, client_id: str | None = None) -> StreamTicket:
-        """Request the short-lived credentials used by Robinscan's live stream."""
-        client_id = client_id or secrets.token_hex(16)
-        if not re.fullmatch(r"[0-9a-f]{32}", client_id):
-            raise ValueError("client_id must be 16 bytes encoded as 32 lowercase hex characters")
-
-        query = urlencode({"clientId": client_id})
-        payload = json.loads(self._get(f"/api/stream-ticket?{query}"))
-        if not isinstance(payload, dict):
-            raise RobinscanError("stream-ticket response is not a JSON object")
-        if isinstance(payload.get("data"), dict):
-            payload = payload["data"]
-
-        stream_url = next(
-            (
-                str(payload[key])
-                for key in ("url", "wsUrl", "websocketUrl")
-                if isinstance(payload.get(key), str) and payload[key]
-            ),
-            "",
-        )
-        ticket_protocol = next(
-            (
-                str(payload[key])
-                for key in ("ticketProtocol", "ticket", "token")
-                if isinstance(payload.get(key), str) and payload[key]
-            ),
-            "",
-        )
-        parsed = urlparse(stream_url)
-        fields = ", ".join(sorted(payload))
-        if parsed.scheme not in {"ws", "wss"} or not parsed.hostname:
-            raise RobinscanError(
-                f"stream-ticket response has no valid WebSocket URL (fields: {fields})"
-            )
-        if not ticket_protocol or not re.fullmatch(
-            r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+", ticket_protocol
-        ):
-            raise RobinscanError(
-                f"stream-ticket response has no valid ticketProtocol (fields: {fields})"
-            )
-        return StreamTicket(stream_url, ticket_protocol)
 
     def blocks(self, limit: int) -> list[Block]:
         limit = max(1, min(limit, 100))
@@ -378,15 +325,9 @@ class RobinscanClient:
         return transfers, traces, pools
 
 
-class RobinscanWebSocket:
-    """Dependency-free WebSocket client for Robinscan update notifications.
+class WebSocketConnection:
+    """Dependency-free WebSocket client used as a live-update notifier."""
 
-    Robinscan data frames use Borsh. A complete data frame is deliberately used
-    only as a wake-up signal; authoritative block and transaction details are
-    then fetched over HTTP and handled by the existing detector.
-    """
-
-    PROTOCOL = "robinscan.borsh.v2"
     MAX_HEADER_BYTES = 64 * 1024
     MAX_FRAME_BYTES = 16 * 1024 * 1024
 
@@ -399,13 +340,18 @@ class RobinscanWebSocket:
     @classmethod
     def connect(
         cls,
-        ticket: StreamTicket,
-        origin: str,
+        url: str,
         timeout: float = 20.0,
-    ) -> "RobinscanWebSocket":
-        parsed = urlparse(ticket.url)
+        *,
+        origin: str | None = None,
+        protocols: tuple[str, ...] = (),
+    ) -> "WebSocketConnection":
+        parsed = urlparse(url)
         if parsed.scheme not in {"ws", "wss"} or not parsed.hostname:
-            raise RobinscanError(f"invalid stream URL: {ticket.url}")
+            raise RobinscanError(f"invalid live feed URL: {url}")
+        for protocol in protocols:
+            if not re.fullmatch(r"[!#$%&'*+\-.^_\x60|~0-9A-Za-z]+", protocol):
+                raise RobinscanError("invalid WebSocket subprotocol")
 
         secure = parsed.scheme == "wss"
         port = parsed.port or (443 if secure else 80)
@@ -429,22 +375,28 @@ class RobinscanWebSocket:
             connection.settimeout(timeout)
 
             websocket_key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
-            request = (
-                f"GET {path} HTTP/1.1\r\n"
-                f"Host: {host_header}\r\n"
-                "Upgrade: websocket\r\n"
-                "Connection: Upgrade\r\n"
-                f"Origin: {origin.rstrip('/')}\r\n"
-                f"Sec-WebSocket-Key: {websocket_key}\r\n"
-                "Sec-WebSocket-Version: 13\r\n"
-                f"Sec-WebSocket-Protocol: {cls.PROTOCOL}, {ticket.ticket_protocol}\r\n"
-                f"User-Agent: {USER_AGENT}\r\n"
-                "\r\n"
-            ).encode("ascii")
+            headers = [
+                f"GET {path} HTTP/1.1",
+                f"Host: {host_header}",
+                "Upgrade: websocket",
+                "Connection: Upgrade",
+                f"Sec-WebSocket-Key: {websocket_key}",
+                "Sec-WebSocket-Version: 13",
+                f"User-Agent: {USER_AGENT}",
+            ]
+            if origin:
+                headers.append(f"Origin: {origin.rstrip('/')}")
+            if protocols:
+                headers.append(f"Sec-WebSocket-Protocol: {', '.join(protocols)}")
+            request = ("\r\n".join(headers) + "\r\n\r\n").encode("ascii")
             connection.sendall(request)
 
             header, remainder = cls._read_handshake(connection)
-            cls._validate_handshake(header, websocket_key)
+            cls._validate_handshake(
+                header,
+                websocket_key,
+                protocols[0] if protocols else None,
+            )
             return cls(connection, remainder)
         except Exception:
             if connection is not None:
@@ -460,15 +412,20 @@ class RobinscanWebSocket:
         while marker not in data:
             chunk = connection.recv(4096)
             if not chunk:
-                raise RobinscanStreamClosed("stream closed during WebSocket handshake")
+                raise LiveStreamClosed("stream closed during WebSocket handshake")
             data.extend(chunk)
             if len(data) > cls.MAX_HEADER_BYTES:
-                raise RobinscanStreamClosed("WebSocket response headers are too large")
+                raise LiveStreamClosed("WebSocket response headers are too large")
         end = data.index(marker) + len(marker)
         return bytes(data[:end]), bytes(data[end:])
 
     @classmethod
-    def _validate_handshake(cls, raw_header: bytes, websocket_key: str) -> None:
+    def _validate_handshake(
+        cls,
+        raw_header: bytes,
+        websocket_key: str,
+        selected_protocol: str | None,
+    ) -> None:
         try:
             lines = raw_header.decode("iso-8859-1").split("\r\n")
             status = int(lines[0].split(" ", 2)[1])
@@ -479,21 +436,22 @@ class RobinscanWebSocket:
                 name, value = line.split(":", 1)
                 headers[name.strip().lower()] = value.strip()
         except (IndexError, ValueError) as exc:
-            raise RobinscanStreamClosed("invalid WebSocket handshake response") from exc
+            raise LiveStreamClosed("invalid WebSocket handshake response") from exc
 
         if status != 101:
-            raise RobinscanStreamClosed(f"WebSocket handshake returned HTTP {status}")
+            raise LiveStreamClosed(f"WebSocket handshake returned HTTP {status}")
         expected_accept = base64.b64encode(
             hashlib.sha1(
                 (websocket_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
             ).digest()
         ).decode("ascii")
         if headers.get("sec-websocket-accept") != expected_accept:
-            raise RobinscanStreamClosed("WebSocket handshake has an invalid accept key")
-        if headers.get("sec-websocket-protocol") != cls.PROTOCOL:
-            raise RobinscanStreamClosed(
-                "WebSocket server did not select the robinscan.borsh.v2 protocol"
-            )
+            raise LiveStreamClosed("WebSocket handshake has an invalid accept key")
+        if (
+            selected_protocol is not None
+            and headers.get("sec-websocket-protocol") != selected_protocol
+        ):
+            raise LiveStreamClosed("WebSocket server selected an unexpected subprotocol")
 
     def _read_exactly(self, length: int) -> bytes:
         data = bytearray()
@@ -504,7 +462,7 @@ class RobinscanWebSocket:
         while len(data) < length:
             chunk = self.connection.recv(length - len(data))
             if not chunk:
-                raise RobinscanStreamClosed("Robinscan live stream disconnected")
+                raise LiveStreamClosed("live feed disconnected")
             data.extend(chunk)
         return bytes(data)
 
@@ -512,7 +470,7 @@ class RobinscanWebSocket:
         first, second = self._read_exactly(2)
         final = bool(first & 0x80)
         if first & 0x70:
-            raise RobinscanStreamClosed("unsupported WebSocket RSV bits")
+            raise LiveStreamClosed("unsupported WebSocket RSV bits")
         opcode = first & 0x0F
         masked = bool(second & 0x80)
         length = second & 0x7F
@@ -521,7 +479,9 @@ class RobinscanWebSocket:
         elif length == 127:
             length = struct.unpack("!Q", self._read_exactly(8))[0]
         if length > self.MAX_FRAME_BYTES:
-            raise RobinscanStreamClosed(f"WebSocket frame exceeds {self.MAX_FRAME_BYTES} bytes")
+            raise LiveStreamClosed(f"WebSocket frame exceeds {self.MAX_FRAME_BYTES} bytes")
+        if opcode >= 0x8 and (not final or length > 125):
+            raise LiveStreamClosed("invalid WebSocket control frame")
         mask = self._read_exactly(4) if masked else b""
         payload = self._read_exactly(length)
         if masked:
@@ -557,7 +517,7 @@ class RobinscanWebSocket:
                 self.closed = True
                 self.connection.close()
                 code = struct.unpack("!H", payload[:2])[0] if len(payload) >= 2 else 1000
-                raise RobinscanStreamClosed(f"Robinscan live stream closed ({code})")
+                raise LiveStreamClosed(f"live feed closed ({code})")
             if opcode == 0x9:
                 self._send_frame(0xA, payload)
                 continue
@@ -565,7 +525,7 @@ class RobinscanWebSocket:
                 continue
             if opcode in {0x1, 0x2}:
                 if self.fragment_opcode is not None:
-                    raise RobinscanStreamClosed(
+                    raise LiveStreamClosed(
                         "new message started before fragmented message ended"
                     )
                 if final:
@@ -574,12 +534,12 @@ class RobinscanWebSocket:
                 continue
             if opcode == 0x0:
                 if self.fragment_opcode is None:
-                    raise RobinscanStreamClosed("unexpected WebSocket continuation frame")
+                    raise LiveStreamClosed("unexpected WebSocket continuation frame")
                 if final:
                     self.fragment_opcode = None
                     return True
                 continue
-            raise RobinscanStreamClosed(f"unsupported WebSocket opcode {opcode}")
+            raise LiveStreamClosed(f"unsupported WebSocket opcode {opcode}")
 
     def close(self) -> None:
         if self.closed:
@@ -593,12 +553,11 @@ class RobinscanWebSocket:
             self.closed = True
             self.connection.close()
 
-    def __enter__(self) -> "RobinscanWebSocket":
+    def __enter__(self) -> "WebSocketConnection":
         return self
 
     def __exit__(self, *_: object) -> None:
         self.close()
-
 
 def parse_transfers(raw: list[dict[str, Any]]) -> tuple[list[Transfer], dict[str, str]]:
     transfers: list[Transfer] = []
@@ -1185,6 +1144,7 @@ def run_live(
     client: RobinscanClient,
     scanner: Scanner,
     *,
+    feed_url: str,
     interval: float,
     json_output: bool,
     details: bool,
@@ -1212,10 +1172,9 @@ def run_live(
     reconnect_delay = 1.0
     while True:
         try:
-            ticket = client.stream_ticket()
-            with RobinscanWebSocket.connect(ticket, client.origin, client.timeout) as stream:
+            with WebSocketConnection.connect(feed_url, timeout=client.timeout) as stream:
                 print(
-                    "[live] Robinscan WebSocket connected",
+                    "[live] Robinhood sequencer feed connected",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -1230,7 +1189,7 @@ def run_live(
                     last_poll = time.monotonic()
         except (RobinscanError, HTTPError, URLError, json.JSONDecodeError, OSError) as exc:
             print(
-                f"[live] stream unavailable ({exc}); polling and retrying in "
+                f"[live] feed unavailable ({exc}); polling Robinscan and retrying in "
                 f"{format_decimal(Decimal(str(reconnect_delay)), 1)}s",
                 file=sys.stderr,
                 flush=True,
@@ -1243,10 +1202,15 @@ def run_live(
                 time.sleep(min(interval, remaining))
                 try:
                     watcher.scan_available()
-                except (RobinscanError, HTTPError, URLError, json.JSONDecodeError, OSError) as poll_error:
+                except (
+                    RobinscanError,
+                    HTTPError,
+                    URLError,
+                    json.JSONDecodeError,
+                    OSError,
+                ) as poll_error:
                     print(f"[live] polling error: {poll_error}", file=sys.stderr, flush=True)
             reconnect_delay = min(max(interval, reconnect_delay * 2), 30.0)
-
 
 def format_decimal(value: Decimal | None, places: int = 9) -> str:
     if value is None:
@@ -1308,6 +1272,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="subscribe to new blocks and print confirmed ARBs only",
     )
     parser.add_argument(
+        "--feed-url",
+        default=DEFAULT_FEED_URL,
+        help="live notification WebSocket (default: Robinhood sequencer feed)",
+    )
+    parser.add_argument(
         "--interval",
         type=float,
         default=2.0,
@@ -1350,6 +1319,7 @@ def main(argv: list[str] | None = None) -> int:
             run_live(
                 client,
                 scanner,
+                feed_url=args.feed_url,
                 interval=args.interval,
                 json_output=args.json,
                 details=args.details,
