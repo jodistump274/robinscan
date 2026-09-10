@@ -1,4 +1,4 @@
-name: live-smoke
+name: live-handshake-probe
 
 on:
   push:
@@ -9,23 +9,112 @@ permissions:
   contents: read
 
 jobs:
-  live-smoke:
+  probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 3
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Receive a real Robinscan WebSocket update
+      - name: Probe Robinscan WebSocket handshake variants
         run: |
           python - <<'PY'
-          from robinscan_arb import RobinscanClient, RobinscanWebSocket
+          import base64
+          import hashlib
+          import json
+          import secrets
+          import socket
+          import ssl
+          from urllib.parse import urlencode, urlparse
+          from urllib.request import Request, urlopen
 
-          client = RobinscanClient(timeout=20, retries=2)
-          ticket = client.stream_ticket()
-          with RobinscanWebSocket.connect(ticket, client.origin, timeout=20) as stream:
-              if not stream.wait_for_update(30):
-                  raise SystemExit("Robinscan WebSocket connected but no update arrived in 30 seconds")
-          print("received a Robinscan live update frame")
+          BASE_PROTOCOL = "robinscan.borsh.v2"
+          API = "https://robinscan.io"
+          TOOL_UA = "robinscan-arb/0.2 (+https://github.com/jodistump274/robinscan)"
+          BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36"
+
+          def ticket(user_agent):
+              client_id = secrets.token_hex(16)
+              request = Request(
+                  API + "/api/stream-ticket?" + urlencode({"clientId": client_id}),
+                  headers={"Accept": "application/json", "User-Agent": user_agent},
+              )
+              with urlopen(request, timeout=20) as response:
+                  payload = json.load(response)
+                  header_names = sorted(response.headers)
+              protocol = payload["ticketProtocol"]
+              parsed = urlparse(payload["url"])
+              print(
+                  "ticket:",
+                  "headers=", header_names,
+                  "url_query=", bool(parsed.query),
+                  "protocol_length=", len(protocol),
+                  "protocol_parts=", len(protocol.split(".")),
+                  "protocol_prefix=", protocol.split(".", 1)[0],
+              )
+              return payload
+
+          def attempt(name, order, origin, user_agent):
+              payload = ticket(user_agent)
+              parsed = urlparse(payload["url"])
+              raw = socket.create_connection((parsed.hostname, parsed.port or 443), timeout=20)
+              connection = ssl.create_default_context().wrap_socket(raw, server_hostname=parsed.hostname)
+              key = base64.b64encode(secrets.token_bytes(16)).decode()
+              protocols = [BASE_PROTOCOL, payload["ticketProtocol"]]
+              if order == "ticket-first":
+                  protocols.reverse()
+              path = parsed.path or "/"
+              if parsed.query:
+                  path += "?" + parsed.query
+              headers = [
+                  f"GET {path} HTTP/1.1",
+                  f"Host: {parsed.netloc}",
+                  "Upgrade: websocket",
+                  "Connection: Upgrade",
+                  f"Sec-WebSocket-Key: {key}",
+                  "Sec-WebSocket-Version: 13",
+                  "Sec-WebSocket-Protocol: " + ", ".join(protocols),
+                  f"User-Agent: {user_agent}",
+              ]
+              if origin:
+                  headers.append("Origin: " + origin)
+              connection.sendall(("\r\n".join(headers) + "\r\n\r\n").encode())
+              response = bytearray()
+              while b"\r\n\r\n" not in response:
+                  response.extend(connection.recv(4096))
+              head, _, body = bytes(response).partition(b"\r\n\r\n")
+              lines = head.decode("iso-8859-1").split("\r\n")
+              response_headers = {}
+              for line in lines[1:]:
+                  if ":" in line:
+                      key_name, value = line.split(":", 1)
+                      response_headers[key_name.lower()] = value.strip()
+              length = int(response_headers.get("content-length", "0"))
+              while len(body) < length:
+                  body += connection.recv(length - len(body))
+              safe_headers = {
+                  key_name: value
+                  for key_name, value in response_headers.items()
+                  if key_name in {"server", "www-authenticate", "sec-websocket-protocol", "content-type"}
+              }
+              print(name, lines[0], safe_headers, body[:300].decode("utf-8", "replace"))
+              connection.close()
+              return lines[0].split()[1] == "101"
+
+          variants = [
+              ("current", "base-first", API, TOOL_UA),
+              ("ticket-first", "ticket-first", API, TOOL_UA),
+              ("no-origin", "base-first", None, TOOL_UA),
+              ("browser-ua", "base-first", API, BROWSER_UA),
+          ]
+          passed = False
+          for variant in variants:
+              try:
+                  if attempt(*variant):
+                      passed = True
+                      break
+              except Exception as error:
+                  print(variant[0], type(error).__name__, str(error))
+          if not passed:
+              raise SystemExit("all handshake variants failed")
           PY
