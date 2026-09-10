@@ -1,4 +1,4 @@
-name: live-handshake-probe
+name: live-browser-probe
 
 on:
   push:
@@ -11,86 +11,82 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 5
     steps:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Probe ticket caching and exact handshake
+      - name: Install browser driver
+        run: python -m pip install --disable-pip-version-check selenium
+      - name: Capture first-party WebSocket handshake metadata
         run: |
           python - <<'PY'
-          import base64
-          import hashlib
           import json
-          import secrets
-          import socket
-          import ssl
-          from urllib.parse import parse_qsl, urlencode, urlparse
-          from urllib.request import Request, urlopen
+          import time
+          from urllib.parse import parse_qsl, urlparse
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
 
-          API = "https://robinscan.io"
-          UA = "robinscan-arb/0.2 (+https://github.com/jodistump274/robinscan)"
+          options = Options()
+          options.add_argument("--headless=new")
+          options.add_argument("--no-sandbox")
+          options.add_argument("--disable-dev-shm-usage")
+          options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
 
-          def get_ticket(no_cache=False):
-              client_id = secrets.token_hex(16)
-              headers = {"Accept": "application/json", "User-Agent": UA}
-              if no_cache:
-                  headers.update({"Cache-Control": "no-cache", "Pragma": "no-cache"})
-              url = API + "/api/stream-ticket?" + urlencode({"clientId": client_id})
-              with urlopen(Request(url, headers=headers), timeout=20) as response:
-                  payload = json.load(response)
-                  meta = {
-                      "age": response.headers.get("Age"),
-                      "cache-control": response.headers.get("Cache-Control"),
-                      "vercel-cache": response.headers.get("X-Vercel-Cache"),
-                  }
-              parsed = urlparse(payload["url"])
-              print(
-                  "ticket-meta", meta,
-                  "ticket-hash", hashlib.sha256(payload["ticketProtocol"].encode()).hexdigest()[:12],
-                  "ticket-segment-lengths", [len(x) for x in payload["ticketProtocol"].split(".")],
-                  "query", [(key, len(value)) for key, value in parse_qsl(parsed.query)],
-              )
-              return payload
-
-          def connect(payload):
-              parsed = urlparse(payload["url"])
-              raw = socket.create_connection((parsed.hostname, parsed.port or 443), timeout=20)
-              connection = ssl.create_default_context().wrap_socket(raw, server_hostname=parsed.hostname)
-              key = base64.b64encode(secrets.token_bytes(16)).decode()
-              path = parsed.path or "/"
-              if parsed.query:
-                  path += "?" + parsed.query
-              request = "\r\n".join([
-                  f"GET {path} HTTP/1.1",
-                  f"Host: {parsed.netloc}",
-                  "Upgrade: websocket",
-                  "Connection: Upgrade",
-                  f"Sec-WebSocket-Key: {key}",
-                  "Sec-WebSocket-Version: 13",
-                  "Sec-WebSocket-Protocol: robinscan.borsh.v2," + payload["ticketProtocol"],
-                  "Origin: https://robinscan.io",
-                  f"User-Agent: {UA}",
-                  "",
-                  "",
-              ]).encode()
-              connection.sendall(request)
-              response = bytearray()
-              while b"\r\n\r\n" not in response:
-                  chunk = connection.recv(4096)
-                  if not chunk:
-                      break
-                  response.extend(chunk)
-              head, _, body = bytes(response).partition(b"\r\n\r\n")
-              first = head.decode("iso-8859-1").split("\r\n", 1)[0]
-              print("handshake", first, body[:200].decode("utf-8", "replace"))
-              connection.close()
-              return " 101 " in first
-
-          first = get_ticket()
-          second = get_ticket(no_cache=True)
-          if hashlib.sha256(first["ticketProtocol"].encode()).digest() == hashlib.sha256(second["ticketProtocol"].encode()).digest():
-              print("WARNING: repeated ticket")
-          if not connect(second):
-              raise SystemExit("no-space handshake failed")
+          driver = webdriver.Chrome(options=options)
+          try:
+              driver.get("https://robinscan.io/blocks")
+              time.sleep(10)
+              found_request = False
+              found_success = False
+              for entry in driver.get_log("performance"):
+                  message = json.loads(entry["message"])["message"]
+                  method = message.get("method")
+                  params = message.get("params", {})
+                  if method == "Network.webSocketWillSendHandshakeRequest":
+                      request = params.get("request", {})
+                      url = request.get("url", "")
+                      if "/api/stream" not in url:
+                          continue
+                      found_request = True
+                      parsed = urlparse(url)
+                      headers = {key.lower(): value for key, value in request.get("headers", {}).items()}
+                      protocols = headers.get("sec-websocket-protocol", "")
+                      safe_protocols = []
+                      for protocol in protocols.split(","):
+                          stripped = protocol.strip()
+                          parts = stripped.split(".")
+                          safe_protocols.append({
+                              "leading_space": len(protocol) - len(protocol.lstrip()),
+                              "parts": len(parts),
+                              "lengths": [len(part) for part in parts],
+                              "prefix": ".".join(parts[:3]),
+                          })
+                      print("WS request URL:", {
+                          "scheme": parsed.scheme,
+                          "host": parsed.hostname,
+                          "path": parsed.path,
+                          "query": [(key, len(value)) for key, value in parse_qsl(parsed.query)],
+                      })
+                      print("WS request header names:", sorted(headers))
+                      print("WS subprotocol structure:", safe_protocols)
+                  elif method == "Network.webSocketHandshakeResponseReceived":
+                      response = params.get("response", {})
+                      url = response.get("url", "")
+                      if "/api/stream" not in url:
+                          continue
+                      print("WS response:", response.get("status"), response.get("statusText"))
+                      print("WS response header names:", sorted(
+                          key.lower() for key in response.get("headers", {})
+                      ))
+                      found_success = response.get("status") == 101
+                  elif method == "Network.webSocketFrameError":
+                      print("WS frame error:", params.get("errorMessage"))
+              print("page title:", driver.title)
+              if not found_request:
+                  raise SystemExit("first-party page made no stream WebSocket request")
+              if not found_success:
+                  raise SystemExit("first-party WebSocket did not complete with HTTP 101")
+          finally:
+              driver.quit()
           PY
