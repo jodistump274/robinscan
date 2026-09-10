@@ -25,6 +25,7 @@ from urllib.request import Request, urlopen
 getcontext().prec = 60
 
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+USER_AGENT = "robinscan-arb/0.2 (+https://github.com/jodistump274/robinscan)"
 NEXT_CHUNK_RE = re.compile(
     r'self\.__next_f\.push\(\s*\[\s*1\s*,\s*("(?:\\.|[^"\\])*")\s*\]\s*\)'
 )
@@ -269,7 +270,7 @@ class RobinscanClient:
             url,
             headers={
                 "Accept": "text/html,application/json",
-                "User-Agent": "robinscan-arb/0.1 (+https://github.com/jodistump274/robinscan)",
+                "User-Agent": USER_AGENT,
             },
         )
         last_error: Exception | None = None
@@ -437,7 +438,7 @@ class RobinscanWebSocket:
                 f"Sec-WebSocket-Key: {websocket_key}\r\n"
                 "Sec-WebSocket-Version: 13\r\n"
                 f"Sec-WebSocket-Protocol: {cls.PROTOCOL}, {ticket.ticket_protocol}\r\n"
-                "User-Agent: robinscan-arb/0.2 (+https://github.com/jodistump274/robinscan)\r\n"
+                f"User-Agent: {USER_AGENT}\r\n"
                 "\r\n"
             ).encode("ascii")
             connection.sendall(request)
