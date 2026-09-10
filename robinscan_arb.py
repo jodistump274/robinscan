@@ -453,37 +453,47 @@ class WebSocketConnection:
         ):
             raise LiveStreamClosed("WebSocket server selected an unexpected subprotocol")
 
-    def _read_exactly(self, length: int) -> bytes:
-        data = bytearray()
-        if self.buffered:
-            take = min(length, len(self.buffered))
-            data.extend(self.buffered[:take])
-            del self.buffered[:take]
-        while len(data) < length:
-            chunk = self.connection.recv(length - len(data))
+    def _fill_buffer(self, length: int) -> None:
+        while len(self.buffered) < length:
+            chunk = self.connection.recv(max(4096, length - len(self.buffered)))
             if not chunk:
                 raise LiveStreamClosed("live feed disconnected")
-            data.extend(chunk)
-        return bytes(data)
+            self.buffered.extend(chunk)
 
     def _read_frame(self) -> tuple[bool, int, bytes]:
-        first, second = self._read_exactly(2)
+        # Do not remove bytes until the whole frame is available. If a socket
+        # timeout lands in the middle of a frame, the next call resumes safely.
+        self._fill_buffer(2)
+        first, second = self.buffered[0], self.buffered[1]
         final = bool(first & 0x80)
         if first & 0x70:
             raise LiveStreamClosed("unsupported WebSocket RSV bits")
         opcode = first & 0x0F
         masked = bool(second & 0x80)
         length = second & 0x7F
+        position = 2
         if length == 126:
-            length = struct.unpack("!H", self._read_exactly(2))[0]
+            self._fill_buffer(position + 2)
+            length = struct.unpack("!H", self.buffered[position : position + 2])[0]
+            position += 2
         elif length == 127:
-            length = struct.unpack("!Q", self._read_exactly(8))[0]
+            self._fill_buffer(position + 8)
+            length = struct.unpack("!Q", self.buffered[position : position + 8])[0]
+            position += 8
         if length > self.MAX_FRAME_BYTES:
             raise LiveStreamClosed(f"WebSocket frame exceeds {self.MAX_FRAME_BYTES} bytes")
         if opcode >= 0x8 and (not final or length > 125):
             raise LiveStreamClosed("invalid WebSocket control frame")
-        mask = self._read_exactly(4) if masked else b""
-        payload = self._read_exactly(length)
+
+        mask = b""
+        if masked:
+            self._fill_buffer(position + 4)
+            mask = bytes(self.buffered[position : position + 4])
+            position += 4
+        frame_end = position + length
+        self._fill_buffer(frame_end)
+        payload = bytes(self.buffered[position:frame_end])
+        del self.buffered[:frame_end]
         if masked:
             payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
         return final, opcode, payload
