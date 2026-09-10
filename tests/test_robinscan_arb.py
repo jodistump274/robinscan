@@ -12,9 +12,7 @@ from robinscan_arb import (
     BlockResult,
     BlockTransaction,
     LiveWatcher,
-    RobinscanClient,
-    RobinscanWebSocket,
-    StreamTicket,
+    WebSocketConnection,
     TransactionResult,
     analyze_transaction,
     decode_next_data,
@@ -36,27 +34,7 @@ class NextDataTests(unittest.TestCase):
 
 
 class StreamTests(unittest.TestCase):
-    def test_reads_real_stream_ticket_field_names(self):
-        class TicketClient(RobinscanClient):
-            requested_path = ""
-
-            def _get(self, path):
-                self.requested_path = path
-                return json.dumps(
-                    {
-                        "url": "wss://api-production.example/api/stream",
-                        "ticketProtocol": "robinscan.ticket.v1.example",
-                    }
-                )
-
-        client = TicketClient()
-        ticket = client.stream_ticket("00112233445566778899aabbccddeeff")
-
-        self.assertEqual(ticket.url, "wss://api-production.example/api/stream")
-        self.assertEqual(ticket.ticket_protocol, "robinscan.ticket.v1.example")
-        self.assertIn("clientId=00112233445566778899aabbccddeeff", client.requested_path)
-
-    def test_websocket_handshake_and_binary_update_without_dependency(self):
+    def test_sequencer_feed_handshake_and_binary_update_without_dependency(self):
         class HandshakeSocket:
             def __init__(self):
                 self.incoming = bytearray()
@@ -83,7 +61,6 @@ class StreamTests(unittest.TestCase):
                     "Upgrade: websocket\r\n"
                     "Connection: Upgrade\r\n"
                     f"Sec-WebSocket-Accept: {accept}\r\n"
-                    "Sec-WebSocket-Protocol: robinscan.borsh.v2\r\n"
                     "\r\n"
                 ).encode("ascii")
                 self.incoming.extend(response + b"\x82\x01\x01")
@@ -99,19 +76,16 @@ class StreamTests(unittest.TestCase):
                 self.closed = True
 
         connection = HandshakeSocket()
-        ticket = StreamTicket(
-            "ws://stream.example/api/stream?source=test",
-            "robinscan.ticket.v1.example",
-        )
         with patch("robinscan_arb.socket.create_connection", return_value=connection):
-            stream = RobinscanWebSocket.connect(ticket, "https://robinscan.io", timeout=1)
+            stream = WebSocketConnection.connect(
+                "ws://feed.example/api/stream?source=test",
+                timeout=1,
+            )
 
         request = connection.sent[0].decode("ascii")
         self.assertIn("GET /api/stream?source=test HTTP/1.1", request)
-        self.assertIn(
-            "Sec-WebSocket-Protocol: robinscan.borsh.v2, robinscan.ticket.v1.example",
-            request,
-        )
+        self.assertNotIn("Sec-WebSocket-Protocol", request)
+        self.assertNotIn("Origin:", request)
         self.assertTrue(stream.wait_for_update(1))
         stream.close()
         self.assertTrue(connection.closed)
