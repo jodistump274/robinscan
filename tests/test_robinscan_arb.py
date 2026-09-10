@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import re
+import socket
 import unittest
 from decimal import Decimal
 from unittest.mock import patch
@@ -89,6 +90,31 @@ class StreamTests(unittest.TestCase):
         self.assertTrue(stream.wait_for_update(1))
         stream.close()
         self.assertTrue(connection.closed)
+
+
+    def test_partial_frame_survives_an_idle_timeout(self):
+        class PartialSocket:
+            def __init__(self):
+                self.parts = [b"\x82", socket.timeout(), b"\x01\x01"]
+
+            def settimeout(self, _timeout):
+                pass
+
+            def recv(self, _length):
+                part = self.parts.pop(0)
+                if isinstance(part, Exception):
+                    raise part
+                return part
+
+            def sendall(self, _data):
+                pass
+
+            def close(self):
+                pass
+
+        stream = WebSocketConnection(PartialSocket())
+        self.assertFalse(stream.wait_for_update(1))
+        self.assertTrue(stream.wait_for_update(1))
 
 
 class LiveWatcherTests(unittest.TestCase):
