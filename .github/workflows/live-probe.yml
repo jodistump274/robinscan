@@ -1,4 +1,4 @@
-name: live-browser-probe
+name: sequencer-feed-smoke
 
 on:
   push:
@@ -9,84 +9,29 @@ permissions:
   contents: read
 
 jobs:
-  probe:
+  smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 3
     steps:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install browser driver
-        run: python -m pip install --disable-pip-version-check selenium
-      - name: Capture first-party WebSocket handshake metadata
+      - run: python -m pip install --disable-pip-version-check websocket-client
+      - name: Receive a Robinhood Chain sequencer feed message
         run: |
           python - <<'PY'
-          import json
-          import time
-          from urllib.parse import parse_qsl, urlparse
-          from selenium import webdriver
-          from selenium.webdriver.chrome.options import Options
+          import websocket
 
-          options = Options()
-          options.add_argument("--headless=new")
-          options.add_argument("--no-sandbox")
-          options.add_argument("--disable-dev-shm-usage")
-          options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-
-          driver = webdriver.Chrome(options=options)
+          connection = websocket.create_connection(
+              "wss://feed.mainnet.chain.robinhood.com",
+              timeout=30,
+              suppress_origin=True,
+          )
           try:
-              driver.get("https://robinscan.io/blocks")
-              time.sleep(10)
-              found_request = False
-              found_success = False
-              for entry in driver.get_log("performance"):
-                  message = json.loads(entry["message"])["message"]
-                  method = message.get("method")
-                  params = message.get("params", {})
-                  if method == "Network.webSocketWillSendHandshakeRequest":
-                      request = params.get("request", {})
-                      url = request.get("url", "")
-                      if "/api/stream" not in url:
-                          continue
-                      found_request = True
-                      parsed = urlparse(url)
-                      headers = {key.lower(): value for key, value in request.get("headers", {}).items()}
-                      protocols = headers.get("sec-websocket-protocol", "")
-                      safe_protocols = []
-                      for protocol in protocols.split(","):
-                          stripped = protocol.strip()
-                          parts = stripped.split(".")
-                          safe_protocols.append({
-                              "leading_space": len(protocol) - len(protocol.lstrip()),
-                              "parts": len(parts),
-                              "lengths": [len(part) for part in parts],
-                              "prefix": ".".join(parts[:3]),
-                          })
-                      print("WS request URL:", {
-                          "scheme": parsed.scheme,
-                          "host": parsed.hostname,
-                          "path": parsed.path,
-                          "query": [(key, len(value)) for key, value in parse_qsl(parsed.query)],
-                      })
-                      print("WS request header names:", sorted(headers))
-                      print("WS subprotocol structure:", safe_protocols)
-                  elif method == "Network.webSocketHandshakeResponseReceived":
-                      response = params.get("response", {})
-                      url = response.get("url", "")
-                      if "/api/stream" not in url:
-                          continue
-                      print("WS response:", response.get("status"), response.get("statusText"))
-                      print("WS response header names:", sorted(
-                          key.lower() for key in response.get("headers", {})
-                      ))
-                      found_success = response.get("status") == 101
-                  elif method == "Network.webSocketFrameError":
-                      print("WS frame error:", params.get("errorMessage"))
-              print("page title:", driver.title)
-              if not found_request:
-                  raise SystemExit("first-party page made no stream WebSocket request")
-              if not found_success:
-                  raise SystemExit("first-party WebSocket did not complete with HTTP 101")
+              message = connection.recv()
+              if not message:
+                  raise SystemExit("sequencer feed returned an empty message")
+              print("received sequencer feed message:", type(message).__name__, len(message), "bytes")
           finally:
-              driver.quit()
+              connection.close()
           PY
