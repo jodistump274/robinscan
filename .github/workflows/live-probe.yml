@@ -1,4 +1,4 @@
-name: live-probe
+name: live-smoke
 
 on:
   push:
@@ -9,36 +9,23 @@ permissions:
   contents: read
 
 jobs:
-  probe:
+  live-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Inspect Robinscan stream ticket shape
+      - name: Receive a real Robinscan WebSocket update
         run: |
           python - <<'PY'
-          import json
-          import secrets
-          from urllib.parse import urlencode, urlparse
-          from urllib.request import Request, urlopen
+          from robinscan_arb import RobinscanClient, RobinscanWebSocket
 
-          client_id = secrets.token_hex(16)
-          url = "https://robinscan.io/api/stream-ticket?" + urlencode({"clientId": client_id})
-          request = Request(url, headers={"Accept": "application/json", "User-Agent": "robinscan-arb-live-probe"})
-          with urlopen(request, timeout=20) as response:
-              payload = json.load(response)
-              print("status:", response.status)
-          if not isinstance(payload, dict):
-              raise SystemExit(f"unexpected payload type: {type(payload).__name__}")
-          print("top-level keys:", sorted(payload))
-          nested = payload.get("data")
-          if isinstance(nested, dict):
-              print("data keys:", sorted(nested))
-              payload = nested
-          for key, value in payload.items():
-              if isinstance(value, str) and value.startswith(("ws://", "wss://", "http://", "https://")):
-                  parsed = urlparse(value)
-                  print(f"url field: {key}; scheme={parsed.scheme}; host={parsed.hostname}; path={parsed.path}")
+          client = RobinscanClient(timeout=20, retries=2)
+          ticket = client.stream_ticket()
+          with RobinscanWebSocket.connect(ticket, client.origin, timeout=20) as stream:
+              if not stream.wait_for_update(30):
+                  raise SystemExit("Robinscan WebSocket connected but no update arrived in 30 seconds")
+          print("received a Robinscan live update frame")
           PY

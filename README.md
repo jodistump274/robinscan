@@ -7,7 +7,8 @@
 1. `/api/blocks` 获取最新区块；
 2. `/block/{number}` 获取区块交易；
 3. `/tx/{hash}` 获取 Token Transfers、Internal Transactions 和 Pools；
-4. 根据实际资产流向重建 DEX Swap Path。
+4. `/api/stream-ticket` + WebSocket 接收实时更新通知；
+5. 根据实际资产流向重建 DEX Swap Path。
 
 不需要 RPC、API Key 或第三方 Python 包。
 
@@ -63,6 +64,32 @@ block 57587426   tx=14  ARB=2  suspected=1  scanned=9  skipped=5  errors=0
 
 ## 常用命令
 
+实时订阅新区块，并逐笔检查其中的候选交易：
+
+```bash
+python -u robinscan_arb.py --live --details
+```
+
+`--live` 启动时把当前最新块作为基线，不重复扫描旧块。之后只要 Robinscan
+推送更新，就立即读取所有新块并检查其中每一笔候选交易。标准输出只打印已经确认的
+闭环 ARB；没有套利时保持为空是正常现象。连接状态、重连和抓取错误写入标准错误。
+
+所以可以直接保存确认套利：
+
+```bash
+python -u robinscan_arb.py --live --details | tee arbs.log
+```
+
+也兼容原来的过滤方式：
+
+```bash
+python -u robinscan_arb.py --live --details | grep --line-buffered -E '^  ARB '
+```
+
+WebSocket 断开或暂时不可用时，程序会按 `--interval` 自动轮询补位，并使用新 ticket
+重连；已打印过的交易会去重。刚出块时页面数据尚未齐全，程序默认再尝试 2 次，可用
+`--live-index-retries` 调整。
+
 扫描最近 25 个区块：
 
 ```bash
@@ -81,7 +108,7 @@ python robinscan_arb.py --limit 25 --details
 python robinscan_arb.py --block 57587427 --details
 ```
 
-持续监听新块：
+旧版纯轮询模式（会打印每个区块的统计行）：
 
 ```bash
 python robinscan_arb.py --watch --limit 10 --interval 2 --details
@@ -91,6 +118,12 @@ python robinscan_arb.py --watch --limit 10 --interval 2 --details
 
 ```bash
 python robinscan_arb.py --limit 25 --json > blocks.json
+```
+
+Live JSON 使用一行一个事件的 NDJSON，便于长期运行：
+
+```bash
+python -u robinscan_arb.py --live --json >> arbs.ndjson
 ```
 
 降低或提高交易请求并发：
@@ -155,3 +188,6 @@ WETH -> PAR -> USDG -> WETH
 ## 注意
 
 Robinscan 并没有直接提供 `arb_count` 字段。本工具依赖其页面中的 Next.js Flight 数据结构。如果 Robinscan 改版导致字段变化，解析器可能需要同步更新。
+
+`--live` 监听的是 Robinscan 已索引的新区块更新，不是内存池 pending 交易。交易上链后，
+索引可能还有数秒延迟；实时帧只负责唤醒扫描器，闭环 Path 和利润仍以完整交易数据为准。

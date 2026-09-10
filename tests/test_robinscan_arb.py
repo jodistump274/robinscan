@@ -1,9 +1,21 @@
+import base64
+import hashlib
+import io
 import json
+import re
 import unittest
 from decimal import Decimal
+from unittest.mock import patch
 
 from robinscan_arb import (
+    Block,
+    BlockResult,
     BlockTransaction,
+    LiveWatcher,
+    RobinscanClient,
+    RobinscanWebSocket,
+    StreamTicket,
+    TransactionResult,
     analyze_transaction,
     decode_next_data,
     extract_json_value,
@@ -21,6 +33,158 @@ class NextDataTests(unittest.TestCase):
         data = decode_next_data(html)
         transactions = extract_json_value(data, "transactions", list)
         self.assertEqual(transactions, [{"hash": "0xabc", "status": 1}])
+
+
+class StreamTests(unittest.TestCase):
+    def test_reads_real_stream_ticket_field_names(self):
+        class TicketClient(RobinscanClient):
+            requested_path = ""
+
+            def _get(self, path):
+                self.requested_path = path
+                return json.dumps(
+                    {
+                        "url": "wss://api-production.example/api/stream",
+                        "ticketProtocol": "robinscan.ticket.v1.example",
+                    }
+                )
+
+        client = TicketClient()
+        ticket = client.stream_ticket("00112233445566778899aabbccddeeff")
+
+        self.assertEqual(ticket.url, "wss://api-production.example/api/stream")
+        self.assertEqual(ticket.ticket_protocol, "robinscan.ticket.v1.example")
+        self.assertIn("clientId=00112233445566778899aabbccddeeff", client.requested_path)
+
+    def test_websocket_handshake_and_binary_update_without_dependency(self):
+        class HandshakeSocket:
+            def __init__(self):
+                self.incoming = bytearray()
+                self.sent = []
+                self.timeout = None
+                self.closed = False
+
+            def settimeout(self, timeout):
+                self.timeout = timeout
+
+            def sendall(self, data):
+                self.sent.append(data)
+                if not data.startswith(b"GET "):
+                    return
+                request = data.decode("ascii")
+                key = re.search(r"Sec-WebSocket-Key: ([^\r]+)", request).group(1)
+                accept = base64.b64encode(
+                    hashlib.sha1(
+                        (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+                    ).digest()
+                ).decode("ascii")
+                response = (
+                    "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Accept: {accept}\r\n"
+                    "Sec-WebSocket-Protocol: robinscan.borsh.v2\r\n"
+                    "\r\n"
+                ).encode("ascii")
+                self.incoming.extend(response + b"\x82\x01\x01")
+
+            def recv(self, length):
+                if not self.incoming:
+                    return b""
+                data = bytes(self.incoming[:length])
+                del self.incoming[:length]
+                return data
+
+            def close(self):
+                self.closed = True
+
+        connection = HandshakeSocket()
+        ticket = StreamTicket(
+            "ws://stream.example/api/stream?source=test",
+            "robinscan.ticket.v1.example",
+        )
+        with patch("robinscan_arb.socket.create_connection", return_value=connection):
+            stream = RobinscanWebSocket.connect(ticket, "https://robinscan.io", timeout=1)
+
+        request = connection.sent[0].decode("ascii")
+        self.assertIn("GET /api/stream?source=test HTTP/1.1", request)
+        self.assertIn(
+            "Sec-WebSocket-Protocol: robinscan.borsh.v2, robinscan.ticket.v1.example",
+            request,
+        )
+        self.assertTrue(stream.wait_for_update(1))
+        stream.close()
+        self.assertTrue(connection.closed)
+
+
+class LiveWatcherTests(unittest.TestCase):
+    def test_skips_baseline_and_emits_only_new_confirmed_arbs_once(self):
+        baseline = Block(100, "0x100", 1)
+        recent = [Block(102, "0x102", 1), Block(101, "0x101", 1), baseline]
+
+        class Client:
+            calls = 0
+
+            def blocks(self, _limit):
+                self.calls += 1
+                return [baseline] if self.calls == 1 else recent
+
+        class FakeScanner:
+            def __init__(self):
+                self.blocks = []
+
+            def scan_block(self, block):
+                self.blocks.append(block.number)
+                result = BlockResult(block=block, scanned_transactions=1)
+                if block.number == 101:
+                    result.suspected.append(
+                        TransactionResult(
+                            hash="0xsuspect",
+                            tx_index=2,
+                            classification="suspected",
+                            reason="open",
+                            path=["WETH", "TOKEN"],
+                        )
+                    )
+                if block.number == 102:
+                    result.confirmed.append(
+                        TransactionResult(
+                            hash="0xarb",
+                            tx_index=3,
+                            classification="confirmed",
+                            reason="closed",
+                            path=["WETH", "TOKEN", "USDG", "WETH"],
+                            profit_token="WETH",
+                            gross_profit=Decimal("0.01"),
+                            net_profit=Decimal("0.009"),
+                        )
+                    )
+                return result
+
+        output = io.StringIO()
+        errors = io.StringIO()
+        scanner = FakeScanner()
+        watcher = LiveWatcher(
+            Client(),
+            scanner,
+            output=output,
+            error_output=errors,
+            retry_delay=0,
+        )
+
+        self.assertEqual(watcher.initialize().number, 100)
+        self.assertEqual(scanner.blocks, [])
+        self.assertEqual(watcher.scan_available(), 2)
+        self.assertEqual(scanner.blocks, [101, 102])
+        self.assertEqual(watcher.scan_available(), 0)
+
+        lines = output.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith("  ARB 0xarb "))
+        self.assertIn("block=102", lines[0])
+        self.assertIn("WETH -> TOKEN -> USDG -> WETH", lines[0])
+        self.assertNotIn("suspect", output.getvalue())
+        self.assertEqual(errors.getvalue(), "")
 
 
 class DetectorTests(unittest.TestCase):

@@ -4,16 +4,22 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import re
+import secrets
+import socket
+import ssl
+import struct
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal, InvalidOperation, getcontext
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, TextIO
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
+from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 getcontext().prec = 60
@@ -51,6 +57,10 @@ SIMPLE_METHODS = {
 
 class RobinscanError(RuntimeError):
     """Raised when Robinscan data cannot be fetched or decoded."""
+
+
+class RobinscanStreamClosed(RobinscanError):
+    """Raised when the Robinscan WebSocket closes or violates the protocol."""
 
 
 def lower(value: Any) -> str:
@@ -137,6 +147,12 @@ class Block:
     hash: str
     tx_count: int
     timestamp: str = ""
+
+
+@dataclass(slots=True)
+class StreamTicket:
+    url: str
+    ticket_protocol: str
 
 
 @dataclass(slots=True)
@@ -242,6 +258,11 @@ class RobinscanClient:
         self.timeout = timeout
         self.retries = retries
 
+    @property
+    def origin(self) -> str:
+        parsed = urlparse(self.base_url)
+        return f"{parsed.scheme}://{parsed.netloc}"
+
     def _get(self, path: str) -> str:
         url = urljoin(self.base_url, path.lstrip("/"))
         request = Request(
@@ -265,6 +286,49 @@ class RobinscanClient:
             if attempt < self.retries:
                 time.sleep(0.25 * (2**attempt))
         raise RobinscanError(f"GET {url} failed: {last_error}")
+
+    def stream_ticket(self, client_id: str | None = None) -> StreamTicket:
+        """Request the short-lived credentials used by Robinscan's live stream."""
+        client_id = client_id or secrets.token_hex(16)
+        if not re.fullmatch(r"[0-9a-f]{32}", client_id):
+            raise ValueError("client_id must be 16 bytes encoded as 32 lowercase hex characters")
+
+        query = urlencode({"clientId": client_id})
+        payload = json.loads(self._get(f"/api/stream-ticket?{query}"))
+        if not isinstance(payload, dict):
+            raise RobinscanError("stream-ticket response is not a JSON object")
+        if isinstance(payload.get("data"), dict):
+            payload = payload["data"]
+
+        stream_url = next(
+            (
+                str(payload[key])
+                for key in ("url", "wsUrl", "websocketUrl")
+                if isinstance(payload.get(key), str) and payload[key]
+            ),
+            "",
+        )
+        ticket_protocol = next(
+            (
+                str(payload[key])
+                for key in ("ticketProtocol", "ticket", "token")
+                if isinstance(payload.get(key), str) and payload[key]
+            ),
+            "",
+        )
+        parsed = urlparse(stream_url)
+        fields = ", ".join(sorted(payload))
+        if parsed.scheme not in {"ws", "wss"} or not parsed.hostname:
+            raise RobinscanError(
+                f"stream-ticket response has no valid WebSocket URL (fields: {fields})"
+            )
+        if not ticket_protocol or not re.fullmatch(
+            r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+", ticket_protocol
+        ):
+            raise RobinscanError(
+                f"stream-ticket response has no valid ticketProtocol (fields: {fields})"
+            )
+        return StreamTicket(stream_url, ticket_protocol)
 
     def blocks(self, limit: int) -> list[Block]:
         limit = max(1, min(limit, 100))
@@ -311,6 +375,228 @@ class RobinscanClient:
         traces = extract_json_value(data, "internalTransactions", list)
         pools = extract_json_value(data, "pools", dict)
         return transfers, traces, pools
+
+
+class RobinscanWebSocket:
+    """Dependency-free WebSocket client for Robinscan update notifications.
+
+    Robinscan data frames use Borsh. A complete data frame is deliberately used
+    only as a wake-up signal; authoritative block and transaction details are
+    then fetched over HTTP and handled by the existing detector.
+    """
+
+    PROTOCOL = "robinscan.borsh.v2"
+    MAX_HEADER_BYTES = 64 * 1024
+    MAX_FRAME_BYTES = 16 * 1024 * 1024
+
+    def __init__(self, connection: socket.socket, buffered: bytes = b"") -> None:
+        self.connection = connection
+        self.buffered = bytearray(buffered)
+        self.fragment_opcode: int | None = None
+        self.closed = False
+
+    @classmethod
+    def connect(
+        cls,
+        ticket: StreamTicket,
+        origin: str,
+        timeout: float = 20.0,
+    ) -> "RobinscanWebSocket":
+        parsed = urlparse(ticket.url)
+        if parsed.scheme not in {"ws", "wss"} or not parsed.hostname:
+            raise RobinscanError(f"invalid stream URL: {ticket.url}")
+
+        secure = parsed.scheme == "wss"
+        port = parsed.port or (443 if secure else 80)
+        host = parsed.hostname
+        host_header = f"[{host}]" if ":" in host else host
+        if port != (443 if secure else 80):
+            host_header = f"{host_header}:{port}"
+        path = parsed.path or "/"
+        if parsed.query:
+            path += f"?{parsed.query}"
+
+        raw_connection: socket.socket | None = None
+        connection: socket.socket | None = None
+        try:
+            raw_connection = socket.create_connection((host, port), timeout=timeout)
+            if secure:
+                context = ssl.create_default_context()
+                connection = context.wrap_socket(raw_connection, server_hostname=host)
+            else:
+                connection = raw_connection
+            connection.settimeout(timeout)
+
+            websocket_key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+            request = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host_header}\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Origin: {origin.rstrip('/')}\r\n"
+                f"Sec-WebSocket-Key: {websocket_key}\r\n"
+                "Sec-WebSocket-Version: 13\r\n"
+                f"Sec-WebSocket-Protocol: {cls.PROTOCOL}, {ticket.ticket_protocol}\r\n"
+                "User-Agent: robinscan-arb/0.2 (+https://github.com/jodistump274/robinscan)\r\n"
+                "\r\n"
+            ).encode("ascii")
+            connection.sendall(request)
+
+            header, remainder = cls._read_handshake(connection)
+            cls._validate_handshake(header, websocket_key)
+            return cls(connection, remainder)
+        except Exception:
+            if connection is not None:
+                connection.close()
+            elif raw_connection is not None:
+                raw_connection.close()
+            raise
+
+    @classmethod
+    def _read_handshake(cls, connection: socket.socket) -> tuple[bytes, bytes]:
+        data = bytearray()
+        marker = b"\r\n\r\n"
+        while marker not in data:
+            chunk = connection.recv(4096)
+            if not chunk:
+                raise RobinscanStreamClosed("stream closed during WebSocket handshake")
+            data.extend(chunk)
+            if len(data) > cls.MAX_HEADER_BYTES:
+                raise RobinscanStreamClosed("WebSocket response headers are too large")
+        end = data.index(marker) + len(marker)
+        return bytes(data[:end]), bytes(data[end:])
+
+    @classmethod
+    def _validate_handshake(cls, raw_header: bytes, websocket_key: str) -> None:
+        try:
+            lines = raw_header.decode("iso-8859-1").split("\r\n")
+            status = int(lines[0].split(" ", 2)[1])
+            headers: dict[str, str] = {}
+            for line in lines[1:]:
+                if ":" not in line:
+                    continue
+                name, value = line.split(":", 1)
+                headers[name.strip().lower()] = value.strip()
+        except (IndexError, ValueError) as exc:
+            raise RobinscanStreamClosed("invalid WebSocket handshake response") from exc
+
+        if status != 101:
+            raise RobinscanStreamClosed(f"WebSocket handshake returned HTTP {status}")
+        expected_accept = base64.b64encode(
+            hashlib.sha1(
+                (websocket_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+            ).digest()
+        ).decode("ascii")
+        if headers.get("sec-websocket-accept") != expected_accept:
+            raise RobinscanStreamClosed("WebSocket handshake has an invalid accept key")
+        if headers.get("sec-websocket-protocol") != cls.PROTOCOL:
+            raise RobinscanStreamClosed(
+                "WebSocket server did not select the robinscan.borsh.v2 protocol"
+            )
+
+    def _read_exactly(self, length: int) -> bytes:
+        data = bytearray()
+        if self.buffered:
+            take = min(length, len(self.buffered))
+            data.extend(self.buffered[:take])
+            del self.buffered[:take]
+        while len(data) < length:
+            chunk = self.connection.recv(length - len(data))
+            if not chunk:
+                raise RobinscanStreamClosed("Robinscan live stream disconnected")
+            data.extend(chunk)
+        return bytes(data)
+
+    def _read_frame(self) -> tuple[bool, int, bytes]:
+        first, second = self._read_exactly(2)
+        final = bool(first & 0x80)
+        if first & 0x70:
+            raise RobinscanStreamClosed("unsupported WebSocket RSV bits")
+        opcode = first & 0x0F
+        masked = bool(second & 0x80)
+        length = second & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", self._read_exactly(2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", self._read_exactly(8))[0]
+        if length > self.MAX_FRAME_BYTES:
+            raise RobinscanStreamClosed(f"WebSocket frame exceeds {self.MAX_FRAME_BYTES} bytes")
+        mask = self._read_exactly(4) if masked else b""
+        payload = self._read_exactly(length)
+        if masked:
+            payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+        return final, opcode, payload
+
+    def _send_frame(self, opcode: int, payload: bytes = b"") -> None:
+        if self.closed:
+            return
+        if len(payload) > 125:
+            raise ValueError("control frame payload is too large")
+        mask = secrets.token_bytes(4)
+        header = bytes((0x80 | opcode, 0x80 | len(payload))) + mask
+        masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+        self.connection.sendall(header + masked)
+
+    def wait_for_update(self, timeout: float) -> bool:
+        """Wait for one complete data message; return False on an idle timeout."""
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            self.connection.settimeout(remaining)
+            try:
+                final, opcode, payload = self._read_frame()
+            except socket.timeout:
+                return False
+
+            if opcode == 0x8:
+                if not self.closed:
+                    self._send_frame(0x8, payload[:125])
+                self.closed = True
+                self.connection.close()
+                code = struct.unpack("!H", payload[:2])[0] if len(payload) >= 2 else 1000
+                raise RobinscanStreamClosed(f"Robinscan live stream closed ({code})")
+            if opcode == 0x9:
+                self._send_frame(0xA, payload)
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode in {0x1, 0x2}:
+                if self.fragment_opcode is not None:
+                    raise RobinscanStreamClosed(
+                        "new message started before fragmented message ended"
+                    )
+                if final:
+                    return True
+                self.fragment_opcode = opcode
+                continue
+            if opcode == 0x0:
+                if self.fragment_opcode is None:
+                    raise RobinscanStreamClosed("unexpected WebSocket continuation frame")
+                if final:
+                    self.fragment_opcode = None
+                    return True
+                continue
+            raise RobinscanStreamClosed(f"unsupported WebSocket opcode {opcode}")
+
+    def close(self) -> None:
+        if self.closed:
+            self.connection.close()
+            return
+        try:
+            self._send_frame(0x8, struct.pack("!H", 1000))
+        except OSError:
+            pass
+        finally:
+            self.closed = True
+            self.connection.close()
+
+    def __enter__(self) -> "RobinscanWebSocket":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
 
 def parse_transfers(raw: list[dict[str, Any]]) -> tuple[list[Transfer], dict[str, str]]:
@@ -751,6 +1037,216 @@ class Scanner:
         return result
 
 
+class LiveWatcher:
+    """Track the indexed tip and emit each newly confirmed ARB exactly once."""
+
+    def __init__(
+        self,
+        client: RobinscanClient,
+        scanner: Scanner,
+        *,
+        json_output: bool = False,
+        details: bool = False,
+        index_retries: int = 2,
+        retry_delay: float = 0.75,
+        output: TextIO | None = None,
+        error_output: TextIO | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.client = client
+        self.scanner = scanner
+        self.json_output = json_output
+        self.details = details
+        self.index_retries = max(0, index_retries)
+        self.retry_delay = max(0.0, retry_delay)
+        self.output = output or sys.stdout
+        self.error_output = error_output or sys.stderr
+        self.sleep = sleep
+        self.cursor = 0
+        self.tip_hash = ""
+        self.emitted_transactions: set[str] = set()
+
+    def initialize(self) -> Block:
+        blocks = self.client.blocks(1)
+        if not blocks:
+            raise RobinscanError("Robinscan returned no latest block")
+        tip = max(blocks, key=lambda block: block.number)
+        self.cursor = tip.number
+        self.tip_hash = tip.hash
+        return tip
+
+    def _scan_with_retry(self, block: Block) -> BlockResult:
+        result: BlockResult | None = None
+        for attempt in range(self.index_retries + 1):
+            result = self.scanner.scan_block(block)
+            observed = result.scanned_transactions + result.skipped_transactions
+            incomplete = bool(result.errors) or (block.tx_count > 0 and observed == 0)
+            if not incomplete or attempt == self.index_retries:
+                return result
+            self.sleep(self.retry_delay * (attempt + 1))
+        assert result is not None
+        return result
+
+    def _emit(self, result: BlockResult) -> None:
+        for item in result.confirmed:
+            if item.hash in self.emitted_transactions:
+                continue
+            self.emitted_transactions.add(item.hash)
+            if self.json_output:
+                event = {
+                    "event": "arb",
+                    "block": asdict(result.block),
+                    "arb": item.to_dict(),
+                }
+                print(
+                    json.dumps(event, ensure_ascii=False, separators=(",", ":")),
+                    file=self.output,
+                    flush=True,
+                )
+                continue
+
+            path = " -> ".join(item.path) if item.path else "unresolved"
+            profit = ""
+            if item.gross_profit is not None:
+                profit = (
+                    f" gross={format_decimal(item.gross_profit)} {item.profit_token}"
+                )
+            if item.net_profit is not None:
+                profit += f" net={format_decimal(item.net_profit)} {item.profit_token}"
+            extra = ""
+            if self.details:
+                dexes = ",".join(
+                    f"{name}x{count}" for name, count in sorted(item.dexes.items())
+                ) or "-"
+                extra = (
+                    f" dex={dexes} executor={item.executor or '-'}"
+                    f" profit_to={item.profit_address or '-'}"
+                )
+            print(
+                f"  ARB {item.hash} block={result.block.number} "
+                f"tx_index={item.tx_index} {path}{profit}{extra}",
+                file=self.output,
+                flush=True,
+            )
+
+        if result.errors:
+            print(
+                f"[live] block {result.block.number}: {len(result.errors)} transaction "
+                "error(s); an ARB may have been missed",
+                file=self.error_output,
+                flush=True,
+            )
+            for error in result.errors:
+                print(f"[live] ERR {error}", file=self.error_output, flush=True)
+
+    def scan_available(self) -> int:
+        """Scan every block after the cursor, oldest first; return blocks scanned."""
+        recent = self.client.blocks(100)
+        if not recent:
+            raise RobinscanError("Robinscan returned no blocks while live")
+        by_number = {block.number: block for block in recent if block.number > 0}
+        tip = max(by_number.values(), key=lambda block: block.number)
+
+        if self.cursor == 0:
+            self.cursor = tip.number
+            self.tip_hash = tip.hash
+            return 0
+        if tip.number < self.cursor:
+            return 0
+
+        if tip.number == self.cursor:
+            if not tip.hash or not self.tip_hash or tip.hash == self.tip_hash:
+                return 0
+            pending = [tip]
+            print(
+                f"[live] block {tip.number} hash changed; rescanning replacement block",
+                file=self.error_output,
+                flush=True,
+            )
+        else:
+            pending = [
+                by_number.get(number, Block(number=number, hash="", tx_count=0))
+                for number in range(self.cursor + 1, tip.number + 1)
+            ]
+
+        for block in pending:
+            result = self._scan_with_retry(block)
+            self._emit(result)
+            self.cursor = block.number
+            if block.hash:
+                self.tip_hash = block.hash
+        if pending[-1].number == tip.number:
+            self.tip_hash = tip.hash
+        return len(pending)
+
+
+def run_live(
+    client: RobinscanClient,
+    scanner: Scanner,
+    *,
+    interval: float,
+    json_output: bool,
+    details: bool,
+    index_retries: int,
+) -> None:
+    watcher = LiveWatcher(
+        client,
+        scanner,
+        json_output=json_output,
+        details=details,
+        index_retries=index_retries,
+    )
+    tip = watcher.initialize()
+    print(
+        f"[live] baseline block {tip.number}; waiting for newly indexed blocks",
+        file=sys.stderr,
+        flush=True,
+    )
+    print(
+        "[live] stdout is intentionally silent until a confirmed closed-loop ARB appears",
+        file=sys.stderr,
+        flush=True,
+    )
+
+    reconnect_delay = 1.0
+    while True:
+        try:
+            ticket = client.stream_ticket()
+            with RobinscanWebSocket.connect(ticket, client.origin, client.timeout) as stream:
+                print(
+                    "[live] Robinscan WebSocket connected",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                reconnect_delay = 1.0
+                last_poll = 0.0
+                while True:
+                    signaled = stream.wait_for_update(interval)
+                    now = time.monotonic()
+                    if signaled and now - last_poll < 0.5:
+                        time.sleep(0.5 - (now - last_poll))
+                    watcher.scan_available()
+                    last_poll = time.monotonic()
+        except (RobinscanError, HTTPError, URLError, json.JSONDecodeError, OSError) as exc:
+            print(
+                f"[live] stream unavailable ({exc}); polling and retrying in "
+                f"{format_decimal(Decimal(str(reconnect_delay)), 1)}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            retry_at = time.monotonic() + reconnect_delay
+            while True:
+                remaining = retry_at - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(interval, remaining))
+                try:
+                    watcher.scan_available()
+                except (RobinscanError, HTTPError, URLError, json.JSONDecodeError, OSError) as poll_error:
+                    print(f"[live] polling error: {poll_error}", file=sys.stderr, flush=True)
+            reconnect_delay = min(max(interval, reconnect_delay * 2), 30.0)
+
+
 def format_decimal(value: Decimal | None, places: int = 9) -> str:
     if value is None:
         return "-"
@@ -803,8 +1299,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--block", type=int, action="append", help="scan one block; may be repeated")
     parser.add_argument("--limit", type=int, default=25, help="number of recent blocks (default: 25, max: 100)")
-    parser.add_argument("--watch", action="store_true", help="continue polling for new blocks")
-    parser.add_argument("--interval", type=float, default=2.0, help="watch polling interval in seconds")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--watch", action="store_true", help="continue polling and print every block")
+    mode.add_argument(
+        "--live",
+        action="store_true",
+        help="subscribe to new blocks and print confirmed ARBs only",
+    )
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=2.0,
+        help="watch interval or live-mode polling fallback in seconds",
+    )
+    parser.add_argument(
+        "--live-index-retries",
+        type=int,
+        default=2,
+        help="retries for a newly indexed block with incomplete data (default: 2)",
+    )
     parser.add_argument("--concurrency", type=int, default=4, help="concurrent transaction requests per block")
     parser.add_argument("--timeout", type=float, default=20.0, help="HTTP timeout in seconds")
     parser.add_argument("--retries", type=int, default=2, help="HTTP retries for 429/5xx/network errors")
@@ -815,9 +1328,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     if args.interval < 0.5:
         raise SystemExit("--interval must be at least 0.5 seconds")
+    if args.live_index_retries < 0:
+        raise SystemExit("--live-index-retries cannot be negative")
+    if args.block and (args.watch or args.live):
+        parser.error("--block cannot be combined with --watch or --live")
     client = RobinscanClient(args.base_url, args.timeout, args.retries)
     scanner = Scanner(client, args.concurrency)
 
@@ -825,6 +1343,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.block:
             blocks = [Block(number=number, hash="", tx_count=0) for number in args.block]
             scan_blocks(scanner, blocks, args.json, args.details)
+            return 0
+
+        if args.live:
+            run_live(
+                client,
+                scanner,
+                interval=args.interval,
+                json_output=args.json,
+                details=args.details,
+                index_retries=args.live_index_retries,
+            )
             return 0
 
         seen: set[str] = set()
