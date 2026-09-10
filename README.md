@@ -7,7 +7,7 @@
 1. `/api/blocks` 获取最新区块；
 2. `/block/{number}` 获取区块交易；
 3. `/tx/{hash}` 获取 Token Transfers、Internal Transactions 和 Pools；
-4. `/api/stream-ticket` + WebSocket 接收实时更新通知；
+4. Robinhood Chain 官方公开 Sequencer Feed 接收实时更新通知；
 5. 根据实际资产流向重建 DEX Swap Path。
 
 不需要 RPC、API Key 或第三方 Python 包。
@@ -70,9 +70,10 @@ block 57587426   tx=14  ARB=2  suspected=1  scanned=9  skipped=5  errors=0
 python -u robinscan_arb.py --live --details
 ```
 
-`--live` 启动时把当前最新块作为基线，不重复扫描旧块。之后只要 Robinscan
-推送更新，就立即读取所有新块并检查其中每一笔候选交易。标准输出只打印已经确认的
-闭环 ARB；没有套利时保持为空是正常现象。连接状态、重连和抓取错误写入标准错误。
+`--live` 启动时把 Robinscan 当前最新块作为基线，不重复扫描旧块。之后由 Robinhood
+Chain 官方公开的 Sequencer Feed 实时唤醒，再从 Robinscan 读取所有新块并检查其中
+每一笔候选交易。标准输出只打印已经确认的闭环 ARB；没有套利时保持为空是正常现象。
+连接状态、重连和抓取错误写入标准错误。
 
 所以可以直接保存确认套利：
 
@@ -86,9 +87,9 @@ python -u robinscan_arb.py --live --details | tee arbs.log
 python -u robinscan_arb.py --live --details | grep --line-buffered -E '^  ARB '
 ```
 
-WebSocket 断开或暂时不可用时，程序会按 `--interval` 自动轮询补位，并使用新 ticket
-重连；已打印过的交易会去重。刚出块时页面数据尚未齐全，程序默认再尝试 2 次，可用
-`--live-index-retries` 调整。
+Sequencer Feed 断开或暂时不可用时，程序会按 `--interval` 自动轮询 Robinscan 补位并
+指数退避重连；已打印过的交易会去重。刚出块时页面数据尚未齐全，程序默认再尝试 2 次，
+可用 `--live-index-retries` 调整。也可用 `--feed-url` 指定其他兼容的 WebSocket 通知源。
 
 扫描最近 25 个区块：
 
@@ -189,5 +190,6 @@ WETH -> PAR -> USDG -> WETH
 
 Robinscan 并没有直接提供 `arb_count` 字段。本工具依赖其页面中的 Next.js Flight 数据结构。如果 Robinscan 改版导致字段变化，解析器可能需要同步更新。
 
-`--live` 监听的是 Robinscan 已索引的新区块更新，不是内存池 pending 交易。交易上链后，
-索引可能还有数秒延迟；实时帧只负责唤醒扫描器，闭环 Path 和利润仍以完整交易数据为准。
+`--live` 的通知来自公开 Sequencer Feed，但判定只扫描 Robinscan 已索引的新区块，不把
+Feed 原始消息直接当作交易，也不是内存池 pending 交易。交易上链后，Robinscan 索引可能
+还有数秒延迟；实时帧只负责唤醒扫描器，闭环 Path 和利润仍以完整交易数据为准。
