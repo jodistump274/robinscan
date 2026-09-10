@@ -1,4 +1,4 @@
-name: sequencer-feed-smoke
+name: live-smoke
 
 on:
   push:
@@ -13,25 +13,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install --disable-pip-version-check websocket-client
       - name: Receive a Robinhood Chain sequencer feed message
         run: |
           python - <<'PY'
-          import websocket
+          from robinscan_arb import DEFAULT_FEED_URL, WebSocketConnection
 
-          connection = websocket.create_connection(
-              "wss://feed.mainnet.chain.robinhood.com",
-              timeout=30,
-              suppress_origin=True,
-          )
-          try:
-              message = connection.recv()
-              if not message:
-                  raise SystemExit("sequencer feed returned an empty message")
-              print("received sequencer feed message:", type(message).__name__, len(message), "bytes")
-          finally:
-              connection.close()
+          with WebSocketConnection.connect(DEFAULT_FEED_URL, timeout=30) as connection:
+              if not connection.wait_for_update(30):
+                  raise SystemExit("sequencer feed connected but no message arrived")
+          print("dependency-free client received a live sequencer feed message")
           PY
