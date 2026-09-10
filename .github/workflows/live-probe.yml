@@ -16,7 +16,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Probe Robinscan WebSocket handshake variants
+      - name: Probe ticket caching and exact handshake
         run: |
           python - <<'PY'
           import base64
@@ -25,96 +25,74 @@ jobs:
           import secrets
           import socket
           import ssl
-          from urllib.parse import urlencode, urlparse
+          from urllib.parse import parse_qsl, urlencode, urlparse
           from urllib.request import Request, urlopen
 
-          BASE_PROTOCOL = "robinscan.borsh.v2"
           API = "https://robinscan.io"
-          TOOL_UA = "robinscan-arb/0.2 (+https://github.com/jodistump274/robinscan)"
-          BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36"
+          UA = "robinscan-arb/0.2 (+https://github.com/jodistump274/robinscan)"
 
-          def ticket(user_agent):
+          def get_ticket(no_cache=False):
               client_id = secrets.token_hex(16)
-              request = Request(
-                  API + "/api/stream-ticket?" + urlencode({"clientId": client_id}),
-                  headers={"Accept": "application/json", "User-Agent": user_agent},
+              headers = {"Accept": "application/json", "User-Agent": UA}
+              if no_cache:
+                  headers.update({"Cache-Control": "no-cache", "Pragma": "no-cache"})
+              url = API + "/api/stream-ticket?" + urlencode(
+                  {"clientId": client_id, "_": secrets.token_hex(8)}
               )
-              with urlopen(request, timeout=20) as response:
+              with urlopen(Request(url, headers=headers), timeout=20) as response:
                   payload = json.load(response)
-                  header_names = sorted(response.headers)
-              protocol = payload["ticketProtocol"]
+                  meta = {
+                      "age": response.headers.get("Age"),
+                      "cache-control": response.headers.get("Cache-Control"),
+                      "vercel-cache": response.headers.get("X-Vercel-Cache"),
+                  }
               parsed = urlparse(payload["url"])
               print(
-                  "ticket:",
-                  "headers=", header_names,
-                  "url_query=", bool(parsed.query),
-                  "protocol_length=", len(protocol),
-                  "protocol_parts=", len(protocol.split(".")),
-                  "protocol_prefix=", protocol.split(".", 1)[0],
+                  "ticket-meta", meta,
+                  "ticket-hash", hashlib.sha256(payload["ticketProtocol"].encode()).hexdigest()[:12],
+                  "ticket-segment-lengths", [len(x) for x in payload["ticketProtocol"].split(".")],
+                  "query", [(key, len(value)) for key, value in parse_qsl(parsed.query)],
               )
               return payload
 
-          def attempt(name, order, origin, user_agent):
-              payload = ticket(user_agent)
+          def connect(payload):
               parsed = urlparse(payload["url"])
               raw = socket.create_connection((parsed.hostname, parsed.port or 443), timeout=20)
               connection = ssl.create_default_context().wrap_socket(raw, server_hostname=parsed.hostname)
               key = base64.b64encode(secrets.token_bytes(16)).decode()
-              protocols = [BASE_PROTOCOL, payload["ticketProtocol"]]
-              if order == "ticket-first":
-                  protocols.reverse()
               path = parsed.path or "/"
               if parsed.query:
                   path += "?" + parsed.query
-              headers = [
+              request = "\r\n".join([
                   f"GET {path} HTTP/1.1",
                   f"Host: {parsed.netloc}",
                   "Upgrade: websocket",
                   "Connection: Upgrade",
                   f"Sec-WebSocket-Key: {key}",
                   "Sec-WebSocket-Version: 13",
-                  "Sec-WebSocket-Protocol: " + ", ".join(protocols),
-                  f"User-Agent: {user_agent}",
-              ]
-              if origin:
-                  headers.append("Origin: " + origin)
-              connection.sendall(("\r\n".join(headers) + "\r\n\r\n").encode())
+                  "Sec-WebSocket-Protocol: robinscan.borsh.v2," + payload["ticketProtocol"],
+                  "Origin: https://robinscan.io",
+                  f"User-Agent: {UA}",
+                  "",
+                  "",
+              ]).encode()
+              connection.sendall(request)
               response = bytearray()
               while b"\r\n\r\n" not in response:
-                  response.extend(connection.recv(4096))
-              head, _, body = bytes(response).partition(b"\r\n\r\n")
-              lines = head.decode("iso-8859-1").split("\r\n")
-              response_headers = {}
-              for line in lines[1:]:
-                  if ":" in line:
-                      key_name, value = line.split(":", 1)
-                      response_headers[key_name.lower()] = value.strip()
-              length = int(response_headers.get("content-length", "0"))
-              while len(body) < length:
-                  body += connection.recv(length - len(body))
-              safe_headers = {
-                  key_name: value
-                  for key_name, value in response_headers.items()
-                  if key_name in {"server", "www-authenticate", "sec-websocket-protocol", "content-type"}
-              }
-              print(name, lines[0], safe_headers, body[:300].decode("utf-8", "replace"))
-              connection.close()
-              return lines[0].split()[1] == "101"
-
-          variants = [
-              ("current", "base-first", API, TOOL_UA),
-              ("ticket-first", "ticket-first", API, TOOL_UA),
-              ("no-origin", "base-first", None, TOOL_UA),
-              ("browser-ua", "base-first", API, BROWSER_UA),
-          ]
-          passed = False
-          for variant in variants:
-              try:
-                  if attempt(*variant):
-                      passed = True
+                  chunk = connection.recv(4096)
+                  if not chunk:
                       break
-              except Exception as error:
-                  print(variant[0], type(error).__name__, str(error))
-          if not passed:
-              raise SystemExit("all handshake variants failed")
+                  response.extend(chunk)
+              head, _, body = bytes(response).partition(b"\r\n\r\n")
+              first = head.decode("iso-8859-1").split("\r\n", 1)[0]
+              print("handshake", first, body[:200].decode("utf-8", "replace"))
+              connection.close()
+              return " 101 " in first
+
+          first = get_ticket()
+          second = get_ticket(no_cache=True)
+          if hashlib.sha256(first["ticketProtocol"].encode()).digest() == hashlib.sha256(second["ticketProtocol"].encode()).digest():
+              print("WARNING: repeated ticket")
+          if not connect(second):
+              raise SystemExit("no-space handshake failed")
           PY
